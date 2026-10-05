@@ -40,6 +40,10 @@ pub struct Out {
     pub stdout: String,
     pub stderr: String,
     pub timed_out: bool,
+    /// ssh itself failed (exit 255) and the command never reported its
+    /// status, so we do not know whether it ran to the end. A command that
+    /// returns 255 on its own still reports, so it is not mistaken for this.
+    pub lost: bool,
 }
 
 impl Out {
@@ -87,19 +91,20 @@ fn run_once(node: Node, cmd: &str, timeout: Duration) -> Out {
     let mut stdout = out.join().unwrap();
     // ssh exits 255 when the remote command dies from a signal, so the
     // command's own status travels in the output.
-    let code = match stdout.rfind(RC_MARK) {
+    let (code, lost) = match stdout.rfind(RC_MARK) {
         Some(at) => {
             let rc = stdout[at + RC_MARK.len()..].trim().parse().unwrap_or(-1);
             stdout.truncate(at);
-            rc
+            (rc, false)
         }
-        None => status.code().unwrap_or(-1),
+        None => (status.code().unwrap_or(-1), status.code() == Some(255)),
     };
     Out {
         code,
         stdout,
         stderr: err.join().unwrap(),
         timed_out,
+        lost,
     }
 }
 
@@ -146,17 +151,26 @@ fn ensure_ready(node: Node) {
     ready.push(node.0);
 }
 
-pub fn run_t(node: Node, cmd: &str, secs: u64) -> Out {
-    ensure_ready(node);
-    let mut o = run_once(node, cmd, Duration::from_secs(secs));
-    // Failing before the command starts, so a retry cannot run it twice.
+/// Runs `attempt` again while ssh fails. A repeatable command is retried even
+/// if it may have started; any other only if ssh could not connect, so it
+/// cannot run twice.
+fn retrying(repeatable: bool, mut attempt: impl FnMut() -> Out) -> Out {
+    let mut o = attempt();
     for _ in 0..4 {
-        if o.code != 255 || o.timed_out || !connect_failed(&o.stderr) {
+        if o.timed_out || !o.lost || !(repeatable || connect_failed(&o.stderr)) {
             break;
         }
         thread::sleep(Duration::from_secs(2));
-        o = run_once(node, cmd, Duration::from_secs(secs));
+        o = attempt();
     }
+    o
+}
+
+fn run(node: Node, cmd: &str, secs: u64, repeatable: bool) -> Out {
+    ensure_ready(node);
+    let o = retrying(repeatable, || {
+        run_once(node, cmd, Duration::from_secs(secs))
+    });
     assert!(
         !o.timed_out,
         "[{}] timed out after {secs}s: {cmd}\n{}",
@@ -164,16 +178,20 @@ pub fn run_t(node: Node, cmd: &str, secs: u64) -> Out {
         o.combined()
     );
     assert!(
-        o.code != 255,
-        "[{}] ssh transport error: {cmd}\n{}",
+        !o.lost,
+        "[{}] ssh connection lost: {cmd}\n{}",
         node.0,
         o.combined()
     );
     o
 }
 
-pub fn succeed(node: Node, cmd: &str) -> String {
-    let o = run_t(node, cmd, 300);
+pub fn run_t(node: Node, cmd: &str, secs: u64) -> Out {
+    run(node, cmd, secs, false)
+}
+
+fn expect_ok(node: Node, cmd: &str, repeatable: bool) -> String {
+    let o = run(node, cmd, 300, repeatable);
     assert_eq!(
         o.code,
         0,
@@ -183,6 +201,16 @@ pub fn succeed(node: Node, cmd: &str) -> String {
         o.combined()
     );
     o.stdout
+}
+
+pub fn succeed(node: Node, cmd: &str) -> String {
+    expect_ok(node, cmd, false)
+}
+
+/// Like `succeed`, for read-only commands such as `journalctl` or `systemctl
+/// show`, which are safe to repeat after a dropped connection.
+pub fn query(node: Node, cmd: &str) -> String {
+    expect_ok(node, cmd, true)
 }
 
 pub fn fail(node: Node, cmd: &str) -> String {
@@ -200,7 +228,7 @@ pub fn fail(node: Node, cmd: &str) -> String {
 pub fn wait_until_succeeds(node: Node, cmd: &str, secs: u64) {
     let deadline = Instant::now() + Duration::from_secs(secs);
     loop {
-        let o = run_t(node, cmd, 60);
+        let o = run(node, cmd, 60, true);
         if o.code == 0 {
             return;
         }
@@ -224,13 +252,13 @@ pub fn wait_for_open_port(node: Node, port: u16) {
 }
 
 pub fn unit_state(node: Node, unit: &str) -> String {
-    succeed(node, &format!("systemctl show -P ActiveState {unit}"))
+    query(node, &format!("systemctl show -P ActiveState {unit}"))
         .trim()
         .to_string()
 }
 
 pub fn journal_count(node: Node, unit: &str, pattern: &str) -> u64 {
-    succeed(
+    query(
         node,
         &format!("journalctl -u {unit} --no-pager | grep -c '{pattern}' || true"),
     )
@@ -285,14 +313,49 @@ pub fn sleep(secs: u64) {
 }
 
 pub fn metrics(node: Node, port: u16) -> Vec<String> {
-    succeed(node, &format!("curl -sf http://127.0.0.1:{port}/metrics"))
+    query(node, &format!("curl -sf http://127.0.0.1:{port}/metrics"))
         .lines()
         .map(String::from)
         .collect()
 }
 
 pub fn unit_result(node: Node, unit: &str) -> String {
-    succeed(node, &format!("systemctl show -p Result --value {unit}"))
+    query(node, &format!("systemctl show -p Result --value {unit}"))
         .trim()
         .to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn out(lost: bool, stderr: &str) -> Out {
+        Out {
+            code: if lost { 255 } else { 0 },
+            stdout: String::new(),
+            stderr: stderr.into(),
+            timed_out: false,
+            lost,
+        }
+    }
+
+    fn calls(repeatable: bool, stderr: &str) -> u32 {
+        let mut n = 0;
+        retrying(repeatable, || {
+            n += 1;
+            out(n < 3, stderr)
+        });
+        n
+    }
+
+    #[test]
+    fn a_repeatable_command_is_retried_after_any_drop() {
+        assert_eq!(calls(true, "Connection reset by peer"), 3);
+    }
+
+    #[test]
+    fn another_command_is_retried_only_if_ssh_never_connected() {
+        assert_eq!(calls(false, "Connection reset by peer"), 1);
+        assert_eq!(calls(false, "Connection refused"), 3);
+    }
 }

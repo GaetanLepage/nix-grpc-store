@@ -226,7 +226,7 @@ pub fn wait_unit_done(units: &str, secs: u64) {
 pub fn assert_unit_success(unit: &str) {
     let result = unit_result(CLIENT, unit);
     if result != "success" {
-        let log = succeed(CLIENT, &format!("journalctl -u {unit}"));
+        let log = query(CLIENT, &format!("journalctl -u {unit}"));
         panic!("{unit} ended with {result}\n{log}");
     }
 }
