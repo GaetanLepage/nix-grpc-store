@@ -54,7 +54,7 @@ fn balancer_auth_client_cert_token_nothing_unknown_cn() {
 fn one_node_schedules_and_both_builders_hold_a_worker_session() {
     farm_ready();
     let ldr = leader();
-    let opened = succeed(
+    let opened = query(
         ldr,
         "journalctl -u nix-grpc-daemon -o cat | grep 'event=worker_session_open'",
     );
@@ -146,7 +146,7 @@ fn two_clients_wanting_the_same_drv_build_it_once() {
     let mut ids: Vec<Vec<String>> = WORKERS
         .into_iter()
         .map(|w| {
-            succeed(w, "journalctl -u nix-grpc-daemon -o cat")
+            query(w, "journalctl -u nix-grpc-daemon -o cat")
                 .lines()
                 .filter(|l| l.contains("method=BuildDerivation") && l.contains("slow-dedup"))
                 .filter_map(|l| l.split_whitespace().find(|t| t.starts_with("assign_id=")))
@@ -469,7 +469,7 @@ fn required_system_features_are_placed_or_refused() {
     retry(60, "gpu build failed", || {
         unit_result(CLIENT, "gpu") == "exit-code"
     });
-    let out = succeed(CLIENT, "journalctl -u gpu -o cat");
+    let out = query(CLIENT, "journalctl -u gpu -o cat");
     assert!(out.contains("features {gpu}"), "{out}");
     retry(30, "no unplaceable build", || {
         gauge(leader(), &unplaceable) == 0
