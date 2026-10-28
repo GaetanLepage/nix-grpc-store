@@ -138,6 +138,8 @@ class NixRemoteService final : public nix::remote::NixRemote::Service
     std::function<void(const std::string &, size_t)> reverseUploadReadHook;
     // After importPaths spools the entire NAR, before the existing apply gate.
     std::function<void(const std::string &)> reverseUploadSpooledHook;
+    // Before publishing a built output; throwing simulates an unreachable cache.
+    std::function<void(const std::string &)> publishHook;
 #endif
 
     // Without the path info cache a path deleted behind our back (gc) is
@@ -222,6 +224,10 @@ public:
     void setReverseUploadSpooledHook(std::function<void(const std::string &)> hook)
     {
         reverseUploadSpooledHook = std::move(hook);
+    }
+    void setPublishHook(std::function<void(const std::string &)> hook)
+    {
+        publishHook = std::move(hook);
     }
 #endif
     // begin() throws this for callers the ACL refuses.
@@ -370,7 +376,11 @@ public:
             }
             if (auto status = nixgrpc::Auth::authorize(call.delegated.caller, "BuildDerivation",
                     nixgrpc::Role::write, request.build_mode()); !status.ok()) return status;
-            if (cancelled() || stopSignal != 0) return {grpc::StatusCode::CANCELLED, "reverse build cancelled"};
+            // As on the direct path: a stopping worker is UNAVAILABLE, which the
+            // client hands back to the scheduler. CANCELLED would read as the
+            // client's own cancel and fail the build.
+            if (stopSignal != 0) return {grpc::StatusCode::UNAVAILABLE, "worker draining"};
+            if (cancelled()) return {grpc::StatusCode::CANCELLED, "reverse build cancelled"};
             if (!coord.builder) return {grpc::StatusCode::FAILED_PRECONDITION, "not a builder"};
             metrics.countRpc("BuildDerivation", call.delegated.caller.name);
             auto const localStore = getStore();
@@ -384,12 +394,26 @@ public:
             };
             nixgrpc::Metrics::Inputs inputs;
             nix::remote::BuildDerivationChunk chunk;
-            auto status = build(cancelled, *localStore, drvPath, drv,
-                static_cast<nix::BuildMode>(request.build_mode()),
-                {.buildTimeout = request.build_timeout(), .maxSilentTime = request.max_silent_time()},
-                request.assign_id(), sendLog, inputs, *chunk.mutable_done(), &afterFinish);
+            // The gateway acknowledges only a delivered result. Without one
+            // (publish failure, cancel, timeout) no acknowledgement comes, so
+            // the deferred Done must go out now or the scheduler keeps this
+            // slot busy until the session drops.
+            auto const retireUnacknowledged = [&] {
+                if (afterFinish) std::exchange(afterFinish, nullptr)();
+            };
+            grpc::Status status;
+            try {
+                status = build(cancelled, *localStore, drvPath, drv,
+                    static_cast<nix::BuildMode>(request.build_mode()),
+                    {.buildTimeout = request.build_timeout(), .maxSilentTime = request.max_silent_time()},
+                    request.assign_id(), sendLog, inputs, *chunk.mutable_done(), &afterFinish);
+            } catch (...) {
+                retireUnacknowledged();
+                throw;
+            }
             if (status.ok() && !emit(chunk))
                 status = {grpc::StatusCode::CANCELLED, "reverse response closed"};
+            if (!status.ok()) retireUnacknowledged();
             return status;
         });
     }
@@ -1119,6 +1143,15 @@ public:
                 outputs.emplace_back(built.back(), localStore.queryPathInfo(path)->narSize);
             }
             phase.next("publish");
+#ifdef NIX_GRPC_DAEMON_EMBED_TEST
+            if (publishHook) {
+                try {
+                    publishHook(std::string(drvPath.to_string()));
+                } catch (nix::Error & err) {
+                    throw Unavailable("publish failed: %s", err.what());
+                }
+            }
+#endif
             publish(localStore, built, cancelled);
             phase.done();
             outcome = nix::remote::Done::BUILT;
