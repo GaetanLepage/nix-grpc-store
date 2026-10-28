@@ -1111,7 +1111,6 @@ public:
                 ? coord.dispatcher->assignmentPod(request->drv_path(), request->assign_id()) : std::nullopt;
             if (selectedPod) {
                 std::atomic<bool> receivedDone{false};
-                std::atomic<bool> resultAccepted{false};
                 auto const status = reverseRelay->call(*context,
                     [&](uint64_t id) {
                         return reverseGateway->prepareBuild(*context,
@@ -1129,7 +1128,7 @@ public:
                     }, [this, drv = request->drv_path(), assignment = request->assign_id(),
                         pod = *selectedPod] {
                         return coord.dispatcher->podOwnsAssignment(pod, drv, assignment);
-                    }, [&] { return resultAccepted.load(); }, [&] { resultAccepted = true; });
+                    }, [&] { return receivedDone.load(); });
                 return status.ok() && !receivedDone.load()
                     ? grpc::Status{grpc::StatusCode::DATA_LOSS, "reverse build completed without a result"} : status;
             }
